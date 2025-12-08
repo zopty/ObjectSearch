@@ -1,26 +1,20 @@
 use std::{
-    fs,
+    fs::File,
+    io::{BufRead, BufReader},
     path::Path,
     sync::{Arc, OnceLock},
 };
 mod ws_popup;
-use aviutl2::{anyhow, generic::GenericPlugin, ldbg, log};
+use aviutl2::{alias::Table, generic::GenericPlugin, ldbg, log};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tap::Pipe;
 use ws_popup::WsPopup;
-mod parser;
-use parser::parse_candicates;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Candidate {
     name: String,
     label: String,
-}
-
-#[derive(Deserialize)]
-struct SearchQuery {
-    query: String,
 }
 
 #[derive(Serialize)]
@@ -34,46 +28,72 @@ struct ObjectSearchPlugin {
     window: WsPopup,
 
     edit_handle: Arc<OnceLock<aviutl2::generic::EditHandle>>,
-    _app_thread: std::thread::JoinHandle<()>,
-    app_flag: std::sync::mpsc::Sender<()>,
     candicates: Arc<Vec<Candidate>>,
 }
 
 unsafe impl Send for ObjectSearchPlugin {}
 unsafe impl Sync for ObjectSearchPlugin {}
 
-static WEB_CONTENT: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/page/dist");
+static WEB_CONTENT: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR\\page\\dist");
 
 impl GenericPlugin for ObjectSearchPlugin {
-    fn new(info: aviutl2::AviUtl2Info) -> aviutl2::AnyResult<Self> {
+    fn new(_info: aviutl2::AviUtl2Info) -> aviutl2::AnyResult<Self> {
         let mut current_dir = std::env::current_exe()?;
         current_dir.pop();
 
-        let mut candicates = Vec::new();
+        let mut ini_path = Path::new("");
         'exist_check: {
-            let path1 = current_dir.join("data/aviutl2.ini");
+            let path1 = current_dir.join("data\\aviutl2.ini");
             if path1.exists() {
-                let content = fs::read_to_string(&path1)?;
-                candicates = parse_candicates(&content).unwrap_or_default();
+                ini_path = Box::leak(Box::new(path1));
                 break 'exist_check;
             }
 
             let path2 = current_dir.join("aviutl2.ini");
             if path2.exists() {
-                let content = fs::read_to_string(&path2)?;
-                candicates = parse_candicates(&content).unwrap_or_default();
+                ini_path = Box::leak(Box::new(path2));
                 break 'exist_check;
             }
 
-            let path = Path::new("C:/ProgramData/aviutl2/aviutl2.ini");
-            if path.exists() {
-                let content = fs::read_to_string(Path::new("C:/ProgramData/aviutl2.ini"))?;
-                candicates = parse_candicates(&content).unwrap_or_default();
+            let path3 = Path::new("C:\\ProgramData\\aviutl2\\aviutl2.ini");
+            if path3.exists() {
+                ini_path = Box::leak(Box::new(path3));
                 break 'exist_check;
+            }
+            ldbg!("cannot find ini file");
+        }
+
+        let file = File::open(ini_path).expect("cannot open ini file");
+        let reader = BufReader::new(file);
+
+        let mut candidates = Vec::new();
+        let mut current_effect_name: Option<String> = None;
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    if line.starts_with("[Effect.") {
+                        current_effect_name = Some(
+                            line.trim_start_matches("[Effect.")
+                                .trim_end_matches("]")
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    if line.starts_with("label=") && current_effect_name.is_some() {
+                        let name = current_effect_name.take().unwrap();
+                        let label = line.trim_start_matches("label=").to_string();
+                        if !label.is_empty() {
+                            candidates.push(Candidate { name, label });
+                            current_effect_name = None;
+                        }
+                        continue;
+                    }
+                }
+                Err(error) => log::error!("{}", error),
             }
         }
 
-        let candicates = Arc::new(candicates);
+        let candicates = Arc::new(candidates);
         let edit_handle = Arc::new(OnceLock::<aviutl2::generic::EditHandle>::new());
 
         let window = WsPopup::new("Object Search", (800, 600))?;
@@ -115,21 +135,18 @@ impl GenericPlugin for ObjectSearchPlugin {
             })
             .build(&window)?;
 
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let app_thread = Self::spawn_app_thread(Arc::clone(&edit_handle), receiver);
-
         Ok(Self {
             webview,
             window,
             edit_handle,
 
-            _app_thread: app_thread,
-            app_flag: sender,
             candicates,
         })
     }
 
     fn register(&mut self, registry: &mut aviutl2::generic::HostAppHandle) {
+        registry.set_plugin_information("Object Search");
+
         let handle = registry.create_edit_handle();
         let _ = self.edit_handle.set(handle);
 
@@ -140,35 +157,124 @@ impl GenericPlugin for ObjectSearchPlugin {
 }
 
 impl ObjectSearchPlugin {
-    fn spawn_app_thread(
-        edit_handle: Arc<OnceLock<aviutl2::generic::EditHandle>>,
-        replace_flag_rx: std::sync::mpsc::Receiver<()>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            loop {
-                // Wait for a replace signal
-                if replace_flag_rx.recv().is_err() {
-                    break;
-                }
-
-                let _ = edit_handle
-                    .wait()
-                    .call_edit_section(move |section| anyhow::Ok(()));
+    fn send_to_webview<T: serde::Serialize>(&self, name: &str, data: &T) {
+        log::debug!("Sending to webview: {}", name);
+        match serde_json::to_value(data) {
+            Ok(json) => {
+                let json = serde_json::json!({ "type": name, "data": json }).to_string();
+                let script = format!(
+                    "try {{ window.bridge && window.bridge._emit({json}); }} catch(e) {{ console.error(e); }}"
+                );
+                let _ = self.webview.evaluate_script(&script);
+                log::debug!("Sent to webview: {}", name);
             }
-        })
-    }
-
-    fn ipc_handler(message_str: String) {
-        if let Ok(query_data) = serde_json::from_str::<SearchQuery>(&message_str) {
-            let query = query_data.query.trim().to_lowercase();
-
-            Self::with_instance(|instance| {
-                instance.search_query(&query);
-            })
+            Err(e) => {
+                log::error!("Failed to serialize data for webview: {}", e);
+            }
         }
     }
 
-    fn search_query(&self, query: &str) {
+    fn ipc_handler(message_str: String) {
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+        enum IpcMessage {
+            Search(String),
+            Select(String),
+        }
+
+        match serde_json::from_str::<IpcMessage>(&message_str) {
+            Ok(msg) => {
+                log::debug!("IPC message received: {:?}", msg);
+                match msg {
+                    IpcMessage::Search(query) => {
+                        let query = query.trim().to_lowercase();
+
+                        Self::with_instance(|instance| {
+                            let result = instance.search_query(&query);
+                            instance.send_to_webview("search_result", &result);
+                        })
+                    }
+                    IpcMessage::Select(name) => Self::with_instance(|instance| {
+                        instance
+                            .edit_handle
+                            .wait()
+                            .call_edit_section(|section| {
+                                let mut layer = 0;
+                                let mut start = 0;
+                                let mut end = 60;
+
+                                if let Some(obj) = section
+                                    .get_focused_object()
+                                    .expect("unable to get focused object")
+                                {
+                                    let object = section.object(&obj);
+                                    let layer_frame = object
+                                        .get_layer_frame()
+                                        .expect("unable to get layer frame");
+                                    layer = layer_frame.layer;
+                                    start = layer_frame.start;
+                                    end = layer_frame.end;
+                                }
+
+                                let mut root = Table::new();
+                                root.insert_value("frame", format!("{},{}", start, end));
+
+                                let mut effect = Table::new();
+                                effect.insert_value("effect.name", &name);
+
+                                let mut table = Table::new();
+                                table.insert_table("Object", root);
+                                table.insert_table("Object.0", effect);
+
+                                loop {
+                                    match section.create_object_from_alias(
+                                        &table.to_string(),
+                                        layer,
+                                        start,
+                                        end - start,
+                                    ) {
+                                        Ok(_) => {
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            layer += 1;
+                                            if layer >= 10 {
+                                                log::info!("too many retries, stopped insertion");
+                                                break;
+                                            }
+                                        }
+                                    };
+                                }
+                            })
+                            .expect("unable to call edit section");
+                    }),
+                }
+            }
+            Err(error) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message_str) {
+                    if let Some(ty) = value.get("type").and_then(|v| v.as_str()) {
+                        match ty {
+                            "search_query" => {
+                                log::error!(
+                                    "Failed to search query from IPC message data: {:?}",
+                                    value.get("data")
+                                );
+                            }
+                            other => {
+                                log::warn!("Unknown IPC message type: {}", other);
+                            }
+                        }
+                    } else {
+                        log::error!("Failed to parse IPC message: {}", error);
+                    }
+                } else {
+                    log::error!("Failed to parse IPC message: {}", error);
+                }
+            }
+        }
+    }
+
+    fn search_query(&self, query: &str) -> SearchResult {
         let matcher = SkimMatcherV2::default();
         let mut filtered_candidates = Vec::new();
 
@@ -205,12 +311,8 @@ impl ObjectSearchPlugin {
         let response = SearchResult {
             candidates: results,
         };
-        let json_response =
-            serde_json::to_string(&response).unwrap_or_else(|_| r#"{"candidates":[]}"#.to_string());
 
-        // 5. JavaScriptのコールバック関数を呼び出して結果を渡す
-        let script = format!("receive_search_results({})", json_response);
-        let _ = self.webview.evaluate_script(&script);
+        response
     }
 }
 

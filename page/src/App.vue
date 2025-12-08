@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import type { Candidate, SearchResult } from './types/search';
-// lodash-esなどのライブラリから debounce 関数をインポートするか、自作します
+import type { Candidate, SearchResult } from './lib/types/search';
 import { debounce } from 'es-toolkit';
+import { ipc } from './lib/ipc';
 
 // --- Vueの状態 ---
 const searchQuery = ref('');
@@ -13,30 +13,21 @@ const selectedKey = ref<string | null>(null);
 
 /**
  * Rust側から結果を受け取るグローバル関数
- * この関数はWryのRustコードによって呼び出されます (window.receive_search_results)
  */
-(window as any).receive_search_results = (result: SearchResult) => {
-  console.log('Received results from Rust:', result);
-  searchResults.value = result.candidates;
-};
-
+ipc.on("search_result", (result) => {
+  try {
+    searchResults.value = (result as SearchResult).candidates;
+  } catch (e) {
+    console.error(e);
+  }
+});
 
 /**
  * 検索クエリをRustのバックエンドに送信する
  * @param query ユーザーが入力したクエリ
  */
 const sendSearchQuery = (query: string) => {
-
-  if ((window as any).rpc && (window as any).rpc.call) {
-    (window as any).rpc.call(
-      "search_request",
-      { query: query }
-    ).catch((error: any) => {
-      console.error('RPC call error:', error);
-    });
-  } else {
-    console.warn('Wry RPC object not found. Running in development mode?');
-  }
+  ipc.searchQuery(query).then((result) => { return result });
 };
 
 // 入力イベントをデバウンス処理
@@ -51,21 +42,39 @@ const debouncedSendQuery = debounce((event: Event) => {
  * @param candidate 選択された候補
  */
 const selectCandidate = (candidate: Candidate) => {
-  selectedKey.value = candidate.key;
+  selectedKey.value = candidate.name;
   console.log('Selected Key:', selectedKey.value);
   // 選択後、別のRPCコールでRust側に選択を通知するなどの処理も可能です。
 };
 
-// コンポーネントがマウントされたら、初期データをロードするために空のクエリを送信
+/**
+ * 候補がダブルクリックされたときに、そのキーを選択し、Wry側に通知する
+ * @param candidate 選択された候補
+ */
+
+const confirmCandidate = (candidate: Candidate) => {
+  selectedKey.value = candidate.name;
+  ipc.confirmCandidate(candidate.name);
+  console.log('Confirmed Key:', selectedKey.value);
+};
+// キーボードナビゲーション
+
 onMounted(() => {
   sendSearchQuery('');
 });
+
 </script>
 
 <template>
   <main class="page-root">
-    <input type="text" name="search" id="search">
-
+    <input type="text" name="search" id="search" @input="debouncedSendQuery" v-model="searchQuery">
+    <div class="search-results">
+      <div v-for="candidate in searchResults" :key="candidate.name" class="candidate-item"
+        :class="{ selected: candidate.name === selectedKey }" @click="selectCandidate(candidate)"
+        @dblclick="confirmCandidate(candidate)">
+        {{ candidate.name }}
+      </div>
+    </div>
   </main>
 </template>
 
@@ -74,6 +83,7 @@ onMounted(() => {
 $bg: #333;
 $fg: #ccc;
 $text-bg: #111;
+$selected-bg: #555;
 
 .page-root {
   display: flex;
@@ -100,5 +110,23 @@ input#search {
   width: 100%;
   padding: 1%;
   border: none;
+}
+
+.search-results {
+  flex-grow: 1;
+  overflow-y: auto;
+}
+
+.candidate-item {
+  padding: 8px 1%;
+  cursor: pointer;
+
+  &:hover {
+    background-color: lighten($bg, 10%);
+  }
+
+  &.selected {
+    background-color: $selected-bg;
+  }
 }
 </style>
