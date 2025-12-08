@@ -1,0 +1,29 @@
+[package]
+name = "object-search"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aviutl2 = { git = "https://github.com/sevenc-nanashi/aviutl2-rs.git", branch = "feat/plugin2" }
+nom = "8.0"
+raw-window-handle = "0.6.2"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+] }
+tao = "0.34.5"
+wry = "0.53.5"
+include_dir = "0.7.4"
+dirs = "6.0.0"
+serde_json = "1.0.145"
+serde = "1.0.228"
+mime_guess = "2.0.5"
+tap = "1.0.1"
+tokio = { version = "1", features = ["full"] }
+fuzzy-matcher = "0.3.7"
+
+[lib]
+name = "object_search"
+crate-type = ["cdylib"]
