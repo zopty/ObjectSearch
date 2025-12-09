@@ -1,15 +1,16 @@
 use std::{
     fs::File,
     io::{BufRead, BufReader},
-    path::Path,
     sync::{Arc, OnceLock},
 };
 mod ws_popup;
-use aviutl2::{alias::Table, generic::GenericPlugin, ldbg, log};
+use aviutl2::{alias::Table, generic::GenericPlugin, log};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use serde::Serialize;
 use tap::Pipe;
 use ws_popup::WsPopup;
+mod config;
+use config::get_ini_path;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Candidate {
@@ -38,58 +39,32 @@ static WEB_CONTENT: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFES
 
 impl GenericPlugin for ObjectSearchPlugin {
     fn new(_info: aviutl2::AviUtl2Info) -> aviutl2::AnyResult<Self> {
-        let mut current_dir = std::env::current_exe()?;
-        current_dir.pop();
-
-        let mut ini_path = Path::new("");
-        'exist_check: {
-            let path1 = current_dir.join("data\\aviutl2.ini");
-            if path1.exists() {
-                ini_path = Box::leak(Box::new(path1));
-                break 'exist_check;
-            }
-
-            let path2 = current_dir.join("aviutl2.ini");
-            if path2.exists() {
-                ini_path = Box::leak(Box::new(path2));
-                break 'exist_check;
-            }
-
-            let path3 = Path::new("C:\\ProgramData\\aviutl2\\aviutl2.ini");
-            if path3.exists() {
-                ini_path = Box::leak(Box::new(path3));
-                break 'exist_check;
-            }
-            ldbg!("cannot find ini file");
-        }
-
+        let ini_path = get_ini_path()?;
         let file = File::open(ini_path).expect("cannot open ini file");
         let reader = BufReader::new(file);
 
         let mut candidates = Vec::new();
         let mut current_effect_name: Option<String> = None;
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    if line.starts_with("[Effect.") {
-                        current_effect_name = Some(
-                            line.trim_start_matches("[Effect.")
-                                .trim_end_matches("]")
-                                .to_string(),
-                        );
-                        continue;
-                    }
-                    if line.starts_with("label=") && current_effect_name.is_some() {
-                        let name = current_effect_name.take().unwrap();
-                        let label = line.trim_start_matches("label=").to_string();
-                        if !label.is_empty() {
-                            candidates.push(Candidate { name, label });
-                            current_effect_name = None;
-                        }
-                        continue;
-                    }
-                }
-                Err(error) => log::error!("{}", error),
+        for line in reader.lines().filter_map(|line| {
+            if let Err(e) = &line {
+                log::error!("failed to read line: {}", e);
+            }
+            line.ok()
+        }) {
+            if line.starts_with("[Effect.") && !line.starts_with("[Effect.object") {
+                current_effect_name = Some(
+                    line.trim_start_matches("[Effect.")
+                        .trim_end_matches("]")
+                        .to_string(),
+                );
+                continue;
+            }
+            if line.starts_with("label=") && current_effect_name.is_some() {
+                let name = current_effect_name.take().unwrap();
+                let label = line.trim_start_matches("label=").to_string();
+                candidates.push(Candidate { name, label });
+                current_effect_name = None;
+                continue;
             }
         }
 
@@ -183,92 +158,94 @@ impl ObjectSearchPlugin {
         }
 
         match serde_json::from_str::<IpcMessage>(&message_str) {
-            Ok(msg) => {
-                log::debug!("IPC message received: {:?}", msg);
-                match msg {
-                    IpcMessage::Search(query) => {
-                        let query = query.trim().to_lowercase();
+            Ok(IpcMessage::Search(query)) => {
+                log::debug!("IPC message received: Search({})", query);
+                let query = query.trim().to_lowercase();
 
-                        Self::with_instance(|instance| {
-                            let result = instance.search_query(&query);
-                            instance.send_to_webview("search_result", &result);
-                        })
-                    }
-                    IpcMessage::Select(name) => Self::with_instance(|instance| {
-                        instance
-                            .edit_handle
-                            .wait()
-                            .call_edit_section(|section| {
-                                let mut layer = 0;
-                                let mut start = 0;
-                                let mut end = 60;
+                Self::with_instance(|instance| {
+                    let result = instance.search_query(&query);
+                    instance.send_to_webview("search_result", &result);
+                })
+            }
+            Ok(IpcMessage::Select(name)) => {
+                log::debug!("IPC message received: Select({})", name);
+                Self::with_instance(|instance| {
+                    instance
+                        .edit_handle
+                        .wait()
+                        .call_edit_section(|section| {
+                            let mut layer = 0;
+                            let mut start = 0;
+                            let mut end = 60;
 
-                                if let Some(obj) = section
-                                    .get_focused_object()
-                                    .expect("unable to get focused object")
-                                {
-                                    let object = section.object(&obj);
-                                    let layer_frame = object
-                                        .get_layer_frame()
-                                        .expect("unable to get layer frame");
-                                    layer = layer_frame.layer;
-                                    start = layer_frame.start;
-                                    end = layer_frame.end;
-                                }
+                            if let Some(obj) = section
+                                .get_focused_object()
+                                .expect("unable to get focused object")
+                            {
+                                let object = section.object(&obj);
+                                let layer_frame =
+                                    object.get_layer_frame().expect("unable to get layer frame");
+                                layer = layer_frame.layer;
+                                start = layer_frame.start;
+                                end = layer_frame.end;
+                            }
 
-                                let mut root = Table::new();
-                                root.insert_value("frame", format!("{},{}", start, end));
+                            let mut root = Table::new();
+                            root.insert_value("frame", format!("{},{}", start, end));
 
-                                let mut effect = Table::new();
-                                effect.insert_value("effect.name", &name);
+                            let mut effect = Table::new();
+                            effect.insert_value("effect.name", &name);
 
-                                let mut table = Table::new();
-                                table.insert_table("Object", root);
-                                table.insert_table("Object.0", effect);
+                            let mut table = Table::new();
+                            table.insert_table("Object", root);
+                            table.insert_table("Object.0", effect);
 
-                                loop {
-                                    match section.create_object_from_alias(
-                                        &table.to_string(),
-                                        layer,
-                                        start,
-                                        end - start,
-                                    ) {
-                                        Ok(_) => {
+                            loop {
+                                match section.create_object_from_alias(
+                                    &table.to_string(),
+                                    layer,
+                                    start,
+                                    end - start,
+                                ) {
+                                    Ok(_) => {
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        layer += 1;
+                                        if layer >= 10 {
+                                            log::info!("too many retries, stopped insertion");
                                             break;
                                         }
-                                        Err(_) => {
-                                            layer += 1;
-                                            if layer >= 10 {
-                                                log::info!("too many retries, stopped insertion");
-                                                break;
-                                            }
-                                        }
-                                    };
-                                }
-                            })
-                            .expect("unable to call edit section");
-                    }),
-                }
+                                    }
+                                };
+                            }
+                        })
+                        .expect("unable to call edit section");
+                })
             }
             Err(error) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message_str) {
-                    if let Some(ty) = value.get("type").and_then(|v| v.as_str()) {
-                        match ty {
-                            "search_query" => {
-                                log::error!(
-                                    "Failed to search query from IPC message data: {:?}",
-                                    value.get("data")
-                                );
-                            }
-                            other => {
-                                log::warn!("Unknown IPC message type: {}", other);
-                            }
-                        }
-                    } else {
+                let value: serde_json::Value = match serde_json::from_str(&message_str) {
+                    Ok(v) => v,
+                    Err(_) => {
                         log::error!("Failed to parse IPC message: {}", error);
+                        return;
                     }
-                } else {
-                    log::error!("Failed to parse IPC message: {}", error);
+                };
+                match value.get("type").and_then(|v| v.as_str()) {
+                    Some("search") => {
+                        log::error!(
+                            "Failed to search query from IPC message data: {:?}",
+                            value.get("data")
+                        );
+                    }
+                    Some("select") => {
+                        log::error!(
+                            "Failed to select result from IPC message data: {:?}",
+                            value.get("data")
+                        );
+                    }
+                    Some(other) => log::warn!("Unknown IPC message type: {}", other),
+                    None => log::error!("Failed to parse IPC message: {}", error),
                 }
             }
         }

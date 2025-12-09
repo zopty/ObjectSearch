@@ -23,6 +23,7 @@ mime_guess = "2.0.5"
 tap = "1.0.1"
 tokio = { version = "1", features = ["full"] }
 fuzzy-matcher = "0.3.7"
+toml = "0.9.8"
 
 [lib]
 name = "object_search"
