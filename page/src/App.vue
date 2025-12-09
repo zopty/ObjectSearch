@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue';
+import { ref, onMounted } from 'vue';
 import type { Candidate, SearchResult } from './lib/types/search';
 import { debounce } from 'es-toolkit';
 import { ipc } from './lib/ipc';
