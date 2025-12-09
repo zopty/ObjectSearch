@@ -50,6 +50,15 @@ export const ipc = {
         return res;
     },
 
+    async reloadList(): Promise<boolean> {
+        console.log("reloading...");
+        bridge.send("reload", undefined);
+        const res = await waitFor<{ completed: boolean }>("reload_result");
+        console.log("result:");
+        console.log(res);
+        return res.completed ?? false;
+    },
+
     confirmCandidate(name: String): void {
         bridge.send("select", name);
     },

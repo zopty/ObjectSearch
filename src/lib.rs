@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 mod ws_popup;
-use aviutl2::{alias::Table, generic::GenericPlugin, log};
+use aviutl2::{AnyResult, alias::Table, generic::GenericPlugin, log};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use serde::Serialize;
 use tap::Pipe;
@@ -29,7 +29,7 @@ struct ObjectSearchPlugin {
     window: WsPopup,
 
     edit_handle: Arc<OnceLock<aviutl2::generic::EditHandle>>,
-    candicates: Arc<Vec<Candidate>>,
+    candidates: Arc<Vec<Candidate>>,
 }
 
 unsafe impl Send for ObjectSearchPlugin {}
@@ -39,36 +39,11 @@ static WEB_CONTENT: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFES
 
 impl GenericPlugin for ObjectSearchPlugin {
     fn new(_info: aviutl2::AviUtl2Info) -> aviutl2::AnyResult<Self> {
-        let ini_path = get_ini_path()?;
-        let file = File::open(ini_path).expect("cannot open ini file");
-        let reader = BufReader::new(file);
+        Self::init_logging();
 
-        let mut candidates = Vec::new();
-        let mut current_effect_name: Option<String> = None;
-        for line in reader.lines().filter_map(|line| {
-            if let Err(e) = &line {
-                log::error!("failed to read line: {}", e);
-            }
-            line.ok()
-        }) {
-            if line.starts_with("[Effect.") && !line.starts_with("[Effect.object") {
-                current_effect_name = Some(
-                    line.trim_start_matches("[Effect.")
-                        .trim_end_matches("]")
-                        .to_string(),
-                );
-                continue;
-            }
-            if line.starts_with("label=") && current_effect_name.is_some() {
-                let name = current_effect_name.take().unwrap();
-                let label = line.trim_start_matches("label=").to_string();
-                candidates.push(Candidate { name, label });
-                current_effect_name = None;
-                continue;
-            }
-        }
+        let _candidates = Self::generate_candidates()?;
 
-        let candicates = Arc::new(candidates);
+        let candidates = Arc::new(_candidates);
         let edit_handle = Arc::new(OnceLock::<aviutl2::generic::EditHandle>::new());
 
         let window = WsPopup::new("Object Search", (800, 600))?;
@@ -115,7 +90,7 @@ impl GenericPlugin for ObjectSearchPlugin {
             window,
             edit_handle,
 
-            candicates,
+            candidates,
         })
     }
 
@@ -132,6 +107,58 @@ impl GenericPlugin for ObjectSearchPlugin {
 }
 
 impl ObjectSearchPlugin {
+    fn init_logging() {
+        aviutl2::logger::LogBuilder::new()
+            .filter_level(if cfg!(debug_assertions) {
+                log::LevelFilter::Debug
+            } else {
+                log::LevelFilter::Info
+            })
+            .init();
+    }
+
+    fn generate_candidates() -> AnyResult<Vec<Candidate>> {
+        let ini_path = get_ini_path()?;
+        let file = File::open(ini_path).expect("cannot open ini file");
+        let reader = BufReader::new(file);
+
+        let mut candidates = Vec::new();
+        let mut current_effect_name: Option<String> = None;
+        for line in reader.lines().filter_map(|line| {
+            if let Err(e) = &line {
+                log::error!("failed to read line: {}", e);
+            }
+            line.ok()
+        }) {
+            if line.starts_with("[Effect.") && !line.starts_with("[Effect.object") {
+                current_effect_name = Some(
+                    line.trim_start_matches("[Effect.")
+                        .trim_end_matches("]")
+                        .to_string(),
+                );
+                continue;
+            }
+            if line.starts_with("label=")
+                && let Some(name) = &current_effect_name
+            {
+                let name = name.to_string();
+                let label = line.trim_start_matches("label=").to_string();
+                if ["カスタムオブジェクト", "シーンチェンジ", "オブジェクト制御"]
+                    .into_iter()
+                    .all(|pattern| !label.contains(pattern))
+                {
+                    candidates.push(Candidate { name, label });
+                }
+                current_effect_name = None;
+                continue;
+            }
+        }
+
+        candidates.sort_by_key(|candidate| candidate.clone().name);
+
+        Ok(candidates)
+    }
+
     fn send_to_webview<T: serde::Serialize>(&self, name: &str, data: &T) {
         log::debug!("Sending to webview: {}", name);
         match serde_json::to_value(data) {
@@ -155,6 +182,7 @@ impl ObjectSearchPlugin {
         enum IpcMessage {
             Search(String),
             Select(String),
+            Reload,
         }
 
         match serde_json::from_str::<IpcMessage>(&message_str) {
@@ -174,54 +202,60 @@ impl ObjectSearchPlugin {
                         .edit_handle
                         .wait()
                         .call_edit_section(|section| {
-                            let mut layer = 0;
-                            let mut start = 0;
-                            let mut end = 60;
-
-                            if let Some(obj) = section
-                                .get_focused_object()
-                                .expect("unable to get focused object")
-                            {
-                                let object = section.object(&obj);
-                                let layer_frame =
-                                    object.get_layer_frame().expect("unable to get layer frame");
-                                layer = layer_frame.layer;
-                                start = layer_frame.start;
-                                end = layer_frame.end;
-                            }
-
-                            let mut root = Table::new();
-                            root.insert_value("frame", format!("{},{}", start, end));
-
                             let mut effect = Table::new();
                             effect.insert_value("effect.name", &name);
 
-                            let mut table = Table::new();
-                            table.insert_table("Object", root);
-                            table.insert_table("Object.0", effect);
+                            if let Ok(Some(focused_object)) = section.get_focused_object() {
+                                let obj = section.object(&focused_object);
 
-                            loop {
-                                match section.create_object_from_alias(
-                                    &table.to_string(),
-                                    layer,
-                                    start,
-                                    end - start,
-                                ) {
-                                    Ok(_) => {
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        layer += 1;
-                                        if layer >= 10 {
-                                            log::info!("too many retries, stopped insertion");
-                                            break;
-                                        }
-                                    }
-                                };
-                            }
+                                let mut table = obj
+                                    .get_alias_parsed()
+                                    .expect("failed to parse object as alias");
+
+                                let object = table
+                                    .get_table_mut("Object")
+                                    .expect("unable to get object table");
+
+                                let index = object.subtables().count();
+
+                                object.insert_table(&format!("{index}"), effect);
+
+                                let layer_frame =
+                                    obj.get_layer_frame().expect("unable to get layer frame");
+
+                                log::debug!("{}", table);
+
+                                section
+                                    .delete_object(&focused_object)
+                                    .expect("unable to delete focused object");
+
+                                let new_object = section
+                                    .create_object_from_alias(
+                                        &table.to_string(),
+                                        layer_frame.layer,
+                                        layer_frame.start,
+                                        layer_frame.end - layer_frame.start,
+                                    )
+                                    .expect("failed to create object from alias");
+
+                                section
+                                    .focus_object(&new_object)
+                                    .expect("unable to focus object");
+                            };
                         })
                         .expect("unable to call edit section");
                 })
+            }
+            Ok(IpcMessage::Reload) => {
+                Self::with_instance_mut(|instance| match Self::generate_candidates() {
+                    Ok(candidates) => {
+                        instance.candidates = candidates.into();
+                        instance.send_to_webview("reload_result", &true);
+                    }
+                    Err(_) => {
+                        instance.send_to_webview("reload_result", &false);
+                    }
+                });
             }
             Err(error) => {
                 let value: serde_json::Value = match serde_json::from_str(&message_str) {
@@ -255,7 +289,7 @@ impl ObjectSearchPlugin {
         let matcher = SkimMatcherV2::default();
         let mut filtered_candidates = Vec::new();
 
-        let candidates_for_matcher = self.candicates.clone();
+        let candidates_for_matcher = self.candidates.clone();
 
         if !query.is_empty() {
             for cand in candidates_for_matcher.iter() {
